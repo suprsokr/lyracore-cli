@@ -8,6 +8,11 @@
 //! that counted markers the build ignores (or missed ones it registers) would describe a different
 //! install than the one about to happen.
 //!
+//! Hook event names are checked against the checkout's `datascripts/runtime-scripts/events.json`,
+//! the same file `module/build.rs` embeds, so the review carries no event list of its own that can
+//! go stale. When that file is missing or malformed, the review reports the event names as
+//! unverified rather than guessing.
+//!
 //! It is an INVENTORY, not a verdict. Tables and reducers are `#[table]`/`#[reducer]` attributes,
 //! which the SpacetimeDB macros act on rather than the build script — they are counted here because
 //! they are what the Package adds to the schema, which is what an operator is being asked to trust.
@@ -27,30 +32,75 @@ use super::{
     artifact,
     tree::{self, EntryKind},
 };
+use crate::project::ProjectLayout;
 use crate::{Error, Result};
 use std::path::Path;
 
-/// The catalog of notify-hook events, as `module/build.rs` knows it. A `game_hook!` naming anything
-/// else fails the server build; the review reports it as unknown rather than silently counting it.
-const HOOK_EVENTS: [&str; 17] = [
-    "on_damage_taken",
-    "on_creature_spawn",
-    "on_levelup",
-    "on_group_invite",
-    "on_death",
-    "on_kill",
-    "on_aggro",
-    "on_cast_resolved",
-    "on_loot",
-    "on_quest_accept",
-    "on_quest_turnin",
-    "on_login",
-    "on_logout",
-    "on_gossip_select",
-    "on_creature_death",
-    "on_hp_threshold",
-    "on_go_used",
-];
+/// The Module's hook catalogue: the `game_hook!` event names `module/build.rs` accepts, read from
+/// the checkout's `datascripts/runtime-scripts/events.json`.
+///
+/// A `game_hook!` naming an event outside the catalogue fails the server build. Reading the file
+/// the build reads keeps the review's annotation true for the checkout it describes, whatever the
+/// CLI's own pin date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookCatalogue {
+    /// Event names from the checkout, in file order.
+    Loaded(Vec<String>),
+    /// The file could not be read. The review reports hook event names as unverified, never as
+    /// accepted or refused.
+    Unverifiable {
+        /// What stopped the read, for the review to print.
+        reason: String,
+    },
+}
+
+impl HookCatalogue {
+    /// Read the catalogue from `project`'s checkout. A missing or malformed file is not an error:
+    /// the review still describes the Package, and its hooks row says the event names are
+    /// unverified.
+    pub fn load(project: &ProjectLayout) -> Self {
+        let text = match std::fs::read_to_string(project.runtime_scripts_dir().join("events.json"))
+        {
+            Ok(text) => text,
+            Err(error) => {
+                return Self::Unverifiable {
+                    reason: format!(
+                        "datascripts/runtime-scripts/events.json could not be read ({error})"
+                    ),
+                }
+            }
+        };
+        match serde_json::from_str::<Vec<HookEventRow>>(&text) {
+            Ok(rows) => Self::Loaded(rows.into_iter().map(|row| row.event).collect()),
+            Err(error) => Self::Unverifiable {
+                reason: format!("datascripts/runtime-scripts/events.json is malformed ({error})"),
+            },
+        }
+    }
+
+    /// Whether the build accepts `event`, or `None` when the catalogue could not be read.
+    fn accepts(&self, event: &str) -> Option<bool> {
+        match self {
+            Self::Loaded(events) => Some(events.iter().any(|known| known == event)),
+            Self::Unverifiable { .. } => None,
+        }
+    }
+
+    /// Why the catalogue is unverifiable, when it is.
+    fn unverifiable_reason(&self) -> Option<&str> {
+        match self {
+            Self::Loaded(_) => None,
+            Self::Unverifiable { reason } => Some(reason),
+        }
+    }
+}
+
+/// One catalogue row. `module/build.rs` deserializes the whole row and refuses the build on a
+/// missing field; the review needs only the event name.
+#[derive(serde::Deserialize)]
+struct HookEventRow {
+    event: String,
+}
 
 /// What a candidate Package would register, and how much unclassified Rust comes with it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -61,6 +111,9 @@ pub struct TrustReview {
     pub reducers: Vec<String>,
     /// `game_hook!(EVENT, fn NAME)` — event and handler.
     pub hooks: Vec<(String, String)>,
+    /// Why the hook event names could not be checked against the checkout's hook catalogue, when it
+    /// was absent or malformed. `render` prints the reason beside the hooks row.
+    pub hooks_unverified: Option<String>,
     /// `game_tick_pass!(fn NAME)` — passes the core scheduler runs every tick.
     pub tick_passes: Vec<String>,
     /// `character_owned!(kind, fn NAME)` — per-character sweeps and cross-shard transport arms.
@@ -82,9 +135,12 @@ pub struct TrustReview {
 }
 
 impl TrustReview {
-    /// Scan `package_dir`. Reads; never writes, never runs anything.
-    pub fn scan(package_dir: &Path) -> Result<Self> {
-        let mut review = Self::default();
+    /// Scan `package_dir` against `hook_catalogue`. Reads; never writes, never runs anything.
+    pub fn scan(package_dir: &Path, hook_catalogue: &HookCatalogue) -> Result<Self> {
+        let mut review = Self {
+            hooks_unverified: hook_catalogue.unverifiable_reason().map(str::to_string),
+            ..Self::default()
+        };
         let entries = tree::collect(package_dir)?;
 
         let rust_files: Vec<_> = entries
@@ -104,7 +160,7 @@ impl TrustReview {
                 ))
             })?;
             review.rust_lines += raw.lines().count();
-            review.scan_source(&strip_comments_and_strings(&raw));
+            review.scan_source(&strip_comments_and_strings(&raw), hook_catalogue);
         }
 
         review.addons = entries
@@ -174,7 +230,7 @@ impl TrustReview {
         Ok(review)
     }
 
-    fn scan_source(&mut self, content: &str) {
+    fn scan_source(&mut self, content: &str, hook_catalogue: &HookCatalogue) {
         for head in attribute_heads(content, "table") {
             let accessor = balanced(head.trim_start())
                 .and_then(|args| top_level_named_ident(&args, "accessor"))
@@ -188,10 +244,10 @@ impl TrustReview {
         }
         for head in marker_heads(content, "game_hook!") {
             if let Some((event, name)) = match_hook(head) {
-                let event = if HOOK_EVENTS.contains(&event.as_str()) {
-                    event
-                } else {
-                    format!("{event} (unknown event — the server build refuses it)")
+                let event = match hook_catalogue.accepts(&event) {
+                    Some(true) => event,
+                    Some(false) => format!("{event} (unknown event — the server build refuses it)"),
+                    None => format!("{event} (event name unverified)"),
                 };
                 self.hooks.push((event, name));
             }
@@ -241,6 +297,11 @@ impl TrustReview {
         out.push_str(&row("tables", self.tables.len(), &self.tables));
         out.push_str(&row("reducers", self.reducers.len(), &self.reducers));
         out.push_str(&row("hooks", self.hooks.len(), &hooks));
+        if !self.hooks.is_empty() {
+            if let Some(reason) = &self.hooks_unverified {
+                out.push_str(&format!("  {:<18} {reason}\n", "hook catalogue"));
+            }
+        }
         out.push_str(&row(
             "tick passes",
             self.tick_passes.len(),
@@ -640,6 +701,12 @@ mod tests {
         tmp
     }
 
+    /// The catalogue a checkout naming `events` would produce. A test that declares no hook still
+    /// passes one, because `scan` always takes the catalogue.
+    fn catalogue(events: &[&str]) -> HookCatalogue {
+        HookCatalogue::Loaded(events.iter().map(|event| (*event).to_string()).collect())
+    }
+
     fn spell_delta(package: &str) -> String {
         format!(
             r#"{{"version":1,"package":"{package}","source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","claims":[{{"table":"game_spell","key":{{"spell_id":133}},"operation":"update","fields":{{"cooldown_ms":{{"type":"u32","value":1500}}}}}}]}}"#
@@ -671,7 +738,7 @@ mod tests {
              character_owned!(delete, fn sweep_delete_pkg_greeter_log(ctx, guid) { });\n",
         )]);
 
-        let review = TrustReview::scan(tmp.path()).unwrap();
+        let review = TrustReview::scan(tmp.path(), &catalogue(&["on_login"])).unwrap();
 
         assert_eq!(review.tables, ["pkg_greeter_log"]);
         assert_eq!(review.reducers, ["pkg_greeter_reset"]);
@@ -705,7 +772,7 @@ mod tests {
              pub struct Legacy { pub id: u64 }\n",
         )]);
 
-        let review = TrustReview::scan(tmp.path()).unwrap();
+        let review = TrustReview::scan(tmp.path(), &catalogue(&[])).unwrap();
 
         assert_eq!(
             review.tables,
@@ -731,7 +798,7 @@ mod tests {
              game_hook!(on_login, fn real(ctx, payload) { });\n",
         )]);
 
-        let review = TrustReview::scan(tmp.path()).unwrap();
+        let review = TrustReview::scan(tmp.path(), &catalogue(&["on_login"])).unwrap();
 
         assert_eq!(review.hooks, [("on_login".to_string(), "real".to_string())]);
         assert!(review.tick_passes.is_empty(), "{review:?}");
@@ -744,7 +811,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join("src")).unwrap();
         std::fs::write(tmp.path().join("src/mod.rs"), [0xff, 0xfe]).unwrap();
 
-        let error = TrustReview::scan(tmp.path()).unwrap_err();
+        let error = TrustReview::scan(tmp.path(), &catalogue(&[])).unwrap_err();
 
         assert!(
             error.to_string().contains("cannot read Rust source"),
@@ -759,7 +826,7 @@ mod tests {
             "game_hook!(on_teatime, fn brew(ctx, payload) { });\n",
         )]);
 
-        let review = TrustReview::scan(tmp.path()).unwrap();
+        let review = TrustReview::scan(tmp.path(), &catalogue(&["on_login"])).unwrap();
 
         assert_eq!(review.hooks.len(), 1);
         assert!(review.hooks[0].0.contains("unknown event"), "{review:?}");
@@ -777,7 +844,7 @@ mod tests {
             ),
         ]);
 
-        let review = TrustReview::scan(tmp.path()).unwrap();
+        let review = TrustReview::scan(tmp.path(), &catalogue(&[])).unwrap();
 
         // Addons are DIRECTORIES; overrides are individual files that shadow stock ones.
         assert_eq!(review.addons, ["Bagger", "Greeter"]);
@@ -788,7 +855,7 @@ mod tests {
     #[test]
     fn the_rendered_review_states_that_unclassified_rust_is_trusted_code() {
         let tmp = package(&[("src/mod.rs", "pub fn helper() {}\n")]);
-        let review = TrustReview::scan(tmp.path()).unwrap();
+        let review = TrustReview::scan(tmp.path(), &catalogue(&[])).unwrap();
 
         let text = review.render(tmp.path());
 
@@ -810,7 +877,7 @@ mod tests {
             ("scripts/README.md", "not a script\n"),
         ]);
 
-        let review = TrustReview::scan(tmp.path()).unwrap();
+        let review = TrustReview::scan(tmp.path(), &catalogue(&[])).unwrap();
 
         assert_eq!(review.runtime_scripts, ["bonus.lua", "ember_echo.ts"]);
         assert!(!review.registers_nothing(), "{review:?}");
@@ -828,7 +895,7 @@ mod tests {
             ("datascripts/welcome.ts", "// a Datascript\n"),
             ("datascripts/README.md", "not a script\n"),
         ]);
-        let review = TrustReview::scan(tmp.path()).unwrap();
+        let review = TrustReview::scan(tmp.path(), &catalogue(&[])).unwrap();
         assert_eq!(review.datascripts, ["datascripts/welcome.ts"]);
         assert!(!review.registers_nothing());
         assert!(review.kinds_summary().contains("1 datascripts"));
@@ -842,7 +909,7 @@ mod tests {
             &two_script_artifact("example.prebuilt"),
         )]);
 
-        let review = TrustReview::scan(tmp.path()).unwrap();
+        let review = TrustReview::scan(tmp.path(), &catalogue(&[])).unwrap();
 
         assert_eq!(review.runtime_scripts, ["example.goodbye", "example.greet"]);
         assert!(!review.registers_nothing(), "{review:?}");
@@ -871,7 +938,7 @@ mod tests {
         std::fs::create_dir_all(&sibling).unwrap();
         std::fs::write(sibling.join("broken.json"), r#"{"version":9}"#).unwrap();
 
-        let review = TrustReview::scan(&candidate).unwrap();
+        let review = TrustReview::scan(&candidate, &catalogue(&[])).unwrap();
 
         assert_eq!(review.package_delta_count, 1);
         assert_eq!(review.package_deltas, [("spell".to_string(), 1)]);
@@ -892,7 +959,7 @@ mod tests {
             &mixed_family_delta("example.mixed"),
         )]);
 
-        let review = TrustReview::scan(tmp.path()).unwrap();
+        let review = TrustReview::scan(tmp.path(), &catalogue(&[])).unwrap();
 
         let text = review.render(tmp.path());
 
@@ -913,7 +980,7 @@ mod tests {
     fn a_malformed_generated_artifact_is_refused_by_the_package_delta_reader() {
         let tmp = package(&[("data/.generated/broken.json", r#"{"version":9}"#)]);
 
-        let error = TrustReview::scan(tmp.path()).unwrap_err();
+        let error = TrustReview::scan(tmp.path(), &catalogue(&[])).unwrap_err();
 
         assert!(error.to_string().contains("broken.json"), "{error}");
     }
@@ -926,7 +993,7 @@ mod tests {
         std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         std::fs::write(&artifact, [0xff]).unwrap();
 
-        let error = TrustReview::scan(&candidate).unwrap_err();
+        let error = TrustReview::scan(&candidate, &catalogue(&[])).unwrap_err();
 
         assert!(error.to_string().contains("non-utf8.json"), "{error}");
         assert!(error.to_string().contains("UTF-8"), "{error}");
@@ -940,8 +1007,8 @@ mod tests {
             ("src/b.rs", "game_hook!(on_kill, fn two(ctx, p) { });\n"),
         ]);
 
-        let first = TrustReview::scan(tmp.path()).unwrap();
-        let second = TrustReview::scan(tmp.path()).unwrap();
+        let first = TrustReview::scan(tmp.path(), &catalogue(&["on_kill"])).unwrap();
+        let second = TrustReview::scan(tmp.path(), &catalogue(&["on_kill"])).unwrap();
 
         assert_eq!(first, second);
         assert_eq!(
@@ -951,5 +1018,86 @@ mod tests {
                 ("on_kill".to_string(), "two".to_string())
             ]
         );
+    }
+
+    /// The defect the checkout read exists for: a pinned CLI carried its own event list, so events
+    /// a newer checkout accepts were annotated as refused by the build.
+    #[test]
+    fn a_hook_event_the_checkout_lists_is_treated_as_known() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let events = tmp.path().join("datascripts/runtime-scripts/events.json");
+        std::fs::create_dir_all(events.parent().unwrap()).unwrap();
+        std::fs::write(&events, r#"[{"event":"on_cast_finished"}]"#).unwrap();
+        let package_dir = tmp.path().join("packages/sample");
+        std::fs::create_dir_all(package_dir.join("src")).unwrap();
+        std::fs::write(
+            package_dir.join("src/mod.rs"),
+            "game_hook!(on_cast_finished, fn cast_finished(ctx, p) { });\n",
+        )
+        .unwrap();
+        let project = ProjectLayout::from_root(tmp.path()).unwrap();
+
+        let review = TrustReview::scan(&package_dir, &HookCatalogue::load(&project)).unwrap();
+
+        assert_eq!(
+            review.hooks,
+            [("on_cast_finished".to_string(), "cast_finished".to_string())]
+        );
+        let text = review.render(&package_dir);
+        assert!(!text.contains("unknown event"), "{text}");
+        assert!(!text.contains("unverified"), "{text}");
+    }
+
+    #[test]
+    fn a_checkout_with_no_hook_catalogue_reports_event_names_unverified() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let package_dir = tmp.path().join("packages/sample");
+        std::fs::create_dir_all(package_dir.join("src")).unwrap();
+        std::fs::write(
+            package_dir.join("src/mod.rs"),
+            "game_hook!(on_cast_finished, fn cast_finished(ctx, p) { });\n",
+        )
+        .unwrap();
+        let project = ProjectLayout::from_root(tmp.path()).unwrap();
+
+        let review = TrustReview::scan(&package_dir, &HookCatalogue::load(&project)).unwrap();
+
+        assert_eq!(review.hooks.len(), 1);
+        assert!(
+            review.hooks[0].0.contains("event name unverified"),
+            "{review:?}"
+        );
+        assert!(!review.hooks[0].0.contains("refuses"), "{review:?}");
+        let text = review.render(&package_dir);
+        assert!(text.contains("hook catalogue"), "{text}");
+        assert!(text.contains("could not be read"), "{text}");
+    }
+
+    #[test]
+    fn a_malformed_hook_catalogue_reports_event_names_unverified() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let events = tmp.path().join("datascripts/runtime-scripts/events.json");
+        std::fs::create_dir_all(events.parent().unwrap()).unwrap();
+        std::fs::write(&events, "not json").unwrap();
+        let package_dir = tmp.path().join("packages/sample");
+        std::fs::create_dir_all(package_dir.join("src")).unwrap();
+        std::fs::write(
+            package_dir.join("src/mod.rs"),
+            "game_hook!(on_login, fn greet(ctx, p) { });\n",
+        )
+        .unwrap();
+        let project = ProjectLayout::from_root(tmp.path()).unwrap();
+
+        let review = TrustReview::scan(&package_dir, &HookCatalogue::load(&project)).unwrap();
+
+        assert!(
+            review.hooks[0].0.contains("event name unverified"),
+            "{review:?}"
+        );
+        let text = review.render(&package_dir);
+        assert!(text.contains("is malformed"), "{text}");
     }
 }

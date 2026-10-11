@@ -23,8 +23,9 @@ use super::stamp::{
     self, ProvenanceStamp, SOURCE_GIT, SOURCE_LOCAL, SOURCE_OFFICIAL, SOURCE_SCAFFOLD,
 };
 use super::{
-    confirm, find, install_tree, inventory, review::TrustReview, shell_quote, InstalledPackage,
-    Origin, PackageName, PackageState,
+    confirm, find, install_tree, inventory,
+    review::{HookCatalogue, TrustReview},
+    shell_quote, InstalledPackage, Origin, PackageName, PackageState,
 };
 use crate::cmd::import::Prompt;
 use crate::cmd::preflight;
@@ -354,7 +355,8 @@ fn update_one(
         .candidate_path(&clone, &package.name)
         .map_err(&candidate)?;
     super::validate_shape(&candidate_path).map_err(&candidate)?;
-    let review = TrustReview::scan(&candidate_path).map_err(&candidate)?;
+    let review =
+        TrustReview::scan(&candidate_path, &HookCatalogue::load(project)).map_err(&candidate)?;
     // Computed before the question, so the tree the operator was shown is the tree that is
     // installed if they say yes.
     let reviewed_identity = stamp::content_identity(&candidate_path).map_err(&candidate)?;

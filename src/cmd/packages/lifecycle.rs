@@ -26,8 +26,9 @@
 
 use super::stamp::{self, SOURCE_GIT, SOURCE_LOCAL, SOURCE_OFFICIAL};
 use super::{
-    collision, collision_reason, confirm, find, review::TrustReview, shard_list, shell_quote,
-    InstalledPackage, PackageName, PackageState,
+    collision, collision_reason, confirm, find,
+    review::{HookCatalogue, TrustReview},
+    shard_list, shell_quote, InstalledPackage, PackageName, PackageState,
 };
 use crate::cmd::dev::{operator_call_failure, reducer_url};
 use crate::cmd::import::Prompt;
@@ -91,7 +92,7 @@ pub fn disable(project: &ProjectLayout, realm: &Realm, name: &str, yes: bool) ->
         )));
     }
 
-    let review = TrustReview::scan(&package.dir)?;
+    let review = TrustReview::scan(&package.dir, &HookCatalogue::load(project))?;
     let state = RuntimeState::load(&project.state_file())?;
     if state.record(Component::Spacetime).is_some() {
         let shards = super::recorded_databases(project)?;
@@ -201,7 +202,7 @@ pub fn remove(project: &ProjectLayout, prompt: &dyn Prompt, name: &str, yes: boo
     print!("{}", super::provenance_report(package.stamp.as_ref()));
     println!(
         "  content   {}",
-        TrustReview::scan(&package.dir)?.kinds_summary()
+        TrustReview::scan(&package.dir, &HookCatalogue::load(project))?.kinds_summary()
     );
     println!();
     print!("{}", recovery_note(&package.name, package.stamp.as_ref()));
@@ -658,7 +659,11 @@ pub(crate) mod tests {
         let tmp = TempDir::new().unwrap();
         let project = checkout(&tmp);
         installed(&tmp, &project, "greeter");
-        let review = TrustReview::scan(&project.packages_dir().join("greeter")).unwrap();
+        let review = TrustReview::scan(
+            &project.packages_dir().join("greeter"),
+            &HookCatalogue::load(&project),
+        )
+        .unwrap();
         assert_eq!(review.tables, ["pkg_greeter_log"], "fixture check");
 
         let warning = table_warning(&PackageName::parse("greeter").unwrap(), &review.tables);

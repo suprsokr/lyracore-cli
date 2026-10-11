@@ -45,7 +45,7 @@ use crate::proc::{CommandSpec, ProcessRunner};
 use crate::project::{Component, ProjectLayout, Topology};
 use crate::state::RuntimeState;
 use crate::{Error, Result};
-use review::TrustReview;
+use review::{HookCatalogue, TrustReview};
 use stamp::ProvenanceStamp;
 use std::path::{Path, PathBuf};
 
@@ -489,7 +489,7 @@ pub(crate) fn install(
     let reviewed_identity = stamp::content_identity(source)?;
     validate_shape(source)?;
 
-    let review = TrustReview::scan(source)?;
+    let review = TrustReview::scan(source, &HookCatalogue::load(project))?;
     println!();
     print!("{}", review.render(source));
     // The review header names the tree it scanned, which for a clone is a scratch directory the
@@ -822,7 +822,8 @@ pub fn new(
     )?;
     println!(
         "{}",
-        review::TrustReview::scan(staged.path())?.render(&reference)
+        review::TrustReview::scan(staged.path(), &review::HookCatalogue::load(project))?
+            .render(&reference)
     );
 
     let identity = stamp::content_identity(staged.path())?;
@@ -1014,6 +1015,7 @@ pub fn list(project: &ProjectLayout) -> Result<()> {
         installed.len() - enabled
     );
 
+    let hook_catalogue = HookCatalogue::load(project);
     for package in &installed {
         let identity = stamp::content_identity(&package.dir)?;
         println!();
@@ -1027,7 +1029,7 @@ pub fn list(project: &ProjectLayout) -> Result<()> {
         }
         println!(
             "  content   {}",
-            TrustReview::scan(&package.dir)?.kinds_summary()
+            TrustReview::scan(&package.dir, &hook_catalogue)?.kinds_summary()
         );
     }
     Ok(())

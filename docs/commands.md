@@ -255,8 +255,10 @@ than the folder name — `my-package` and `my_package` fold onto the same module
 
 Then it prints a **Trust Review** and asks. The review is a deterministic, read-only scan of the
 candidate folder using a port of the build's own marker scan, so a commented-out or quoted marker
-registers nothing here either. It reports tables, reducers, hooks, tick passes, character-owned
-sweeps, addons, client overrides and Runtime Script sources. Runtime Scripts are named because they
+registers nothing here either. Hook event names are checked against the checkout's
+`datascripts/runtime-scripts/events.json`, the catalogue `module/build.rs` reads; a checkout without
+that file reports them as unverified. It reports tables, reducers, hooks, tick passes,
+character-owned sweeps, addons, client overrides and Runtime Script sources. Runtime Scripts are named because they
 run on the Realm once the Package is built. It also names Package-local Datascripts, which
 `packages build` runs as trusted code on the author's machine. The review states plainly that
 everything else in the Package's Rust is trusted code and that it is an inventory, not a security
